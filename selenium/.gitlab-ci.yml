@@ -1,0 +1,219 @@
+stages:
+  - install
+  - build
+  - test
+  - allure-report
+  - deploy
+
+variables:
+  MAVEN_IMAGE: "maven:3.9.6-eclipse-temurin-17"
+  MAVEN_OPTS: "-Djava.awt.headless=true -Dfile.encoding=UTF-8"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-fast --show-version"
+  ALLURE_VERSION: "2.27.0"
+  SELENIUM_HEADLESS: "true"
+  CI: "true"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .m2/repository/
+    - target/allure-results/
+
+install_deps:
+  stage: install
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  script:
+    - echo "=== УСТАНОВКА ЗАВИСИМОСТЕЙ ==="
+    - mvn $MAVEN_CLI_OPTS dependency:resolve dependency:go-offline
+  cache:
+    policy: push
+    paths:
+      - .m2/repository/
+  only:
+    - pushes
+    - merge_requests
+    - master
+    - main
+
+build_project:
+  stage: build
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  script:
+    - echo "=== СБОРКА ПРОЕКТА ==="
+    - mvn $MAVEN_CLI_OPTS clean compile test-compile
+    - echo "=== ПРОВЕРКА КОМПИЛЯЦИИ ==="
+    - find target/test-classes -name "*.class" | head -5
+  cache:
+    policy: pull
+    paths:
+      - .m2/repository/
+  dependencies:
+    - install_deps
+  artifacts:
+    paths:
+      - target/
+    expire_in: 1 hour
+
+setup_browser:
+  stage: test
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  before_script:
+    - echo "=== УСТАНОВКА CHROME И ЗАВИСИМОСТЕЙ ==="
+    - apt-get update -qq
+    - apt-get install -y -qq wget gnupg unzip libgconf-2-4 libnss3-dev libxss1 libasound2
+    - wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
+    - echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+    - apt-get update -qq
+    - apt-get install -y -qq google-chrome-stable
+    - google-chrome --version
+    - echo "=== УСТАНОВКА Allure ==="
+    - wget -q "https://github.com/allure-framework/allure2/releases/download/$ALLURE_VERSION/allure-$ALLURE_VERSION.tgz"
+    - tar -xzf "allure-$ALLURE_VERSION.tgz" -C /usr/local/
+    - ln -s "/usr/local/allure-$ALLURE_VERSION/bin/allure" /usr/local/bin/allure
+    - allure --version
+  script:
+    - echo "=== ПОДГОТОВКА СРЕДЫ ==="
+    - echo "JAVA_HOME: $JAVA_HOME"
+    - echo "Chrome version: $(google-chrome --version)"
+    - echo "Allure version: $(allure --version)"
+  artifacts:
+    paths:
+      - /usr/local/bin/allure
+    expire_in: 1 day
+
+run_tests:
+  stage: test
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  dependencies:
+    - build_project
+    - setup_browser
+  script:
+    - echo "=== ЗАПУСК АВТОТЕСТОВ ==="
+    - echo "Переменные окружения:"
+    - echo "CI: $CI"
+    - echo "SELENIUM_HEADLESS: $SELENIUM_HEADLESS"
+
+    - |
+      set +e
+      mvn $MAVEN_CLI_OPTS test \
+        -Dselenide.headless=$SELENIUM_HEADLESS \
+        -Dallure.results.directory=target/allure-results \
+        -DfailIfNoTests=false \
+        -Dmaven.test.failure.ignore=true
+      TEST_EXIT_CODE=$?
+      set -e
+      
+      echo "Код завершения тестов: $TEST_EXIT_CODE"
+
+    - echo "=== АНАЛИЗ РЕЗУЛЬТАТОВ ==="
+    - |
+      if [ -d "target/surefire-reports" ]; then
+        echo "📊 ОТЧЕТЫ SUREFIRE:"
+        echo "===================="
+      
+        total_tests=0
+        total_failures=0
+        total_errors=0
+        total_skipped=0
+      
+        for report in target/surefire-reports/*.xml; do
+          if [ -f "$report" ]; then
+            tests=$(grep -o 'tests="[0-9]*"' "$report" | cut -d'"' -f2)
+            failures=$(grep -o 'failures="[0-9]*"' "$report" | cut -d'"' -f2)
+            errors=$(grep -o 'errors="[0-9]*"' "$report" | cut -d'"' -f2)
+            skipped=$(grep -o 'skipped="[0-9]*"' "$report" | cut -d'"' -f2)
+      
+            total_tests=$((total_tests + ${tests:-0}))
+            total_failures=$((total_failures + ${failures:-0}))
+            total_errors=$((total_errors + ${errors:-0}))
+            total_skipped=$((total_skipped + ${skipped:-0}))
+          fi
+        done
+      
+        echo "   Всего тестов: $total_tests"
+        echo "   Провалено: $total_failures"
+        echo "   Ошибок: $total_errors"
+        echo "   Пропущено: $total_skipped"
+      
+        if [ "$total_failures" -gt 0 ] || [ "$total_errors" -gt 0 ]; then
+          echo "❌ УПАВШИЕ ТЕСТЫ:"
+          find target/surefire-reports -name "*.txt" -exec echo "   {}" \;
+        fi
+      
+      else
+        echo "⚠️  Отчеты surefire-reports не найдены"
+      fi
+      
+      if [ -d "target/allure-results" ]; then
+        echo "✅ Allure результаты собраны"
+        ls -la target/allure-results/
+      else
+        echo "⚠️  Allure результаты не найдены"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - target/allure-results/
+      - target/surefire-reports/
+      - target/screenshots/
+    reports:
+      junit: target/surefire-reports/**/*.xml
+    expire_in: 1 week
+  cache:
+    policy: pull
+    paths:
+      - .m2/repository/
+  allow_failure: true
+
+generate_allure_report:
+  stage: allure-report
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  dependencies:
+    - run_tests
+  script:
+    - echo "=== ГЕНЕРАЦИЯ ALLURE ОТЧЕТА ==="
+    - |
+      if [ -d "target/allure-results" ] && [ "$(ls -A target/allure-results)" ]; then
+        echo "Создание Allure отчета..."
+        allure generate target/allure-results -o target/allure-report --clean
+        echo "Allure отчет создан в target/allure-report/"
+      else
+        echo "Нет данных для создания Allure отчета"
+        mkdir -p target/allure-report
+        echo "<html><body><h1>No test results found</h1></body></html>" > target/allure-report/index.html
+      fi
+  artifacts:
+    when: always
+    paths:
+      - target/allure-report/
+    expire_in: 1 week
+
+deploy_allure:
+  stage: deploy
+  image: $MAVEN_IMAGE
+  tags: [lms]
+  dependencies:
+    - generate_allure_report
+  script:
+    - echo "=== ДЕПЛОЙ ALLURE ОТЧЕТА ==="
+    - echo "Allure отчет доступен в артефактах пайплайна"
+    - echo "Для просмотра скачайте архив target/allure-report/"
+  only:
+    - master
+    - main
+    - merge_requests
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(feature|hotfix)\/.+/
+      when: always
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+    - when: never
